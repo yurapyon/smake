@@ -13,6 +13,16 @@
     '()
     lst))
 
+;
+
+(define (to-port p . args)
+  (for-each
+    (lambda (a)
+      (display a p))
+    args))
+
+;
+
 (define-type matrix
   constructor: _make-matrix
   read-only:
@@ -88,23 +98,11 @@
   (letrec* ((node-ct (matrix-x-length matr))
             (_iota (iota node-ct))
             (mark-vec (make-vector node-ct #f))
-            (is-marked?
-              (lambda (idx)
-                (vector-ref mark-vec idx)))
-            (mark!
-              (lambda (idx)
-                (vector-set! mark-vec idx #t)))
             (push-vec (make-vector node-ct #f))
-            (is-pushed?
-              (lambda (idx)
-                (vector-ref push-vec idx)))
-            (push!
-              (lambda (idx)
-                (vector-set! push-vec idx #t)))
             (visit
               (lambda (idx)
-                (if (is-marked? idx)
-                    (when (not (is-pushed? idx))
+                (if (vector-ref mark-vec idx)
+                    (when (not (vector-ref push-vec idx))
                       (error "cycle detected"))
                     (let ((to-visit
                             (filter
@@ -112,9 +110,9 @@
                                 ; todo could check for cycles here for better error reporting
                                 (matrix-ref matr idx next))
                               _iota)))
-                      (mark! idx)
+                      (vector-set! mark-vec idx)
                       (map visit to-visit)
-                      (push! idx)
+                      (vector-set! push-vec idx)
                       (set! ret (cons idx ret))))))
             (ret '()))
     (map visit _iota)
@@ -127,12 +125,184 @@
         (table-ref rl idx))
       (graph-ordering g))))
 
+; file system stuff
+
+(define *script-filepath* (make-parameter ".smake.ss"))
+(define *cache-filepath* (make-parameter "._smake.ss"))
+
+(define default-script "; smake default script")
+(define default-cache '((hashes . ())))
+
+(define (configured?)
+  (and (file-exists? (*script-filepath*))
+       (file-exists? (*cache-filepath*))))
+
+(define (assert-configured)
+  (unless (configured?)
+    (error "smake not configure. please call (configure)")))
+
+(define (verbose-create-file type name init-fn)
+  (unless (file-exists? name)
+    (call-with-output-file name init-fn)
+    (display type)
+    (display " file ")
+    (display name)
+    (display " created")
+    (newline)))
+
+(define (verbose-delete-file type name)
+  (when (file-exists? name)
+    (delete-file name)
+    (display type)
+    (display " file ")
+    (display name)
+    (display " deleted")
+    (newline)))
+
+(define (configure)
+  (unless (configured?)
+    (verbose-create-file "script" (*script-filepath*)
+      (lambda (p)
+        (display default-script p)))
+    (verbose-create-file "cache" (*cache-filepath*)
+      (lambda (p)
+        (write default-cache p)))
+    (display "smake configured")
+    (newline)))
+
+(define (deconfigure #!optional delete-script)
+  (verbose-delete-file "cache" (*cache-filepath*))
+  (when delete-script
+    (verbose-delete-file "script" (*script-filepath*))))
+
+;
+
+(define *initialized* (make-parameter #f))
+
+(define (initialized)
+  (assert-configured)
+  (load-cache))
+  ; load and run script
+
+(define (assert-initialized)
+  (unless (*initialized*)
+    (error "smake not initialized")))
+
+;
+
+(define *cache* (make-parameter #f))
+(define *hashes* (make-parameter #f))
+
+(define (load-cache)
+  (let ((alist (call-with-input-file (*cache-filepath*) read)))
+    (*cache* (list->table alist))
+    (*hashes* (list->table (cache-ref 'hashes)))))
+
+(define (save-cache)
+  (assert-initialized)
+  (cache-set! 'hashes (table->list (*hashes*)))
+  (call-with-output-file (*cache-filepath*)
+    (lambda (p)
+      (write (table->list (*cache*)) p))))
+
+(define (cache-ref sym)
+  (table-ref (*cache*) sym))
+
+(define (cache-set! sym to)
+  (table-set! (*cache*) sym to))
+
+;
+
+(define (gen-hash filename)
+  (let* ((ret (shell-command (string-append "md5sum " filename) #t))
+         (err (car ret))
+         (hash (substring (cdr ret) 0 32)))
+    (if (not (= err 0))
+        (error "couldnt generate hash for file" filename)
+        hash)))
+
+; returns if hash matches cached hash
+(define (check-hash filename)
+  (assert-initialized)
+  (let* ((ht (*hashes*))
+         (cached (table-ref ht filename #f))))
+  (if (not cached)
+      #f
+      (string=? cached (gen-hash filename))))
+
+(define (update-hash! filename)
+  (table-set! (*hashes*) filename (gen-hash filename)))
+
+;
+
 (define-type target
   read-only:
   filename
   sources     ; filenames
   rule        ; a fn to create target w/ filename
   clean-rule) ; usually #f
+
+; rules are funcitons that take a target and return a commandline to run
+; return "" to do nothing
+
+;
+
+(define *c-compiler* (make-parameter "gcc"))
+(define *cpp-compiler* (make-parameter "g++"))
+
+(define (objize filename)
+  (let ((base (path-strip-extension filename)))
+    (string-append
+      (path-expand base "obj")
+      ".o")))
+
+(define (compiler-for-file filename)
+  (let ((ftype (path-extension filename)))
+    (cond
+      ((string-ci=? ftype ".c") (*c-compiler*))
+      ((or (string-ci=? ftype ".cpp")
+           (string-ci=? ftype ".cc")) (*cpp-compiler*))
+      (else
+        (error "no compiler found:" filename)))))
+
+; todo cleanup all this
+; cmds can take a string or setenv variables
+(define (make-system-cmd cmd)
+  (lambda ()
+    (let ((ret (shell-command cmd #t)))
+      (when (not (= 0 (car ret)))
+        (println (cdr ret))
+        (error "command failed" cmd))
+      (println (cdr ret)))))
+
+(define (make-compile-str out in options)
+  (let ((p (open-output-string)))
+    (to-port p (compiler-for-file in) " ")
+    (for-each
+      (lambda (opt)
+        (to-port p opt " "))
+      options)
+    (to-port p "-c " in " -o " out)
+    (get-output-string p)))
+
+(define (make-null-rule file)
+  (lambda () #t))
+
+(define (make-default-clean-rule file)
+  (make-system-cmd (string-append "rm " file)))
+
+(define (make-target-basic-file filename sources)
+  (make-target filename
+               sources
+               (make-null-rule filename)
+               (make-null-rule filename)))
+
+(define (make-target-obj-file in options)
+  (let ((obj-name (objize in)))
+    (make-target obj-name
+                 (list in)
+                 (make-system-cmd (make-compile-str obj-name in options))
+                 (make-default-clean-rule obj-name))))
 
 (define targets
   (list
@@ -155,41 +325,4 @@
         ; debug-targets)
 
 ; can cache the .smake file too
-
-; automatic style
-;   dependency graph
-;     check if files have been changed
-;     keep a cache
-;   actions are added on the command line
-;   cant do things file by file
-
-; manual style
-;   command line completion
-;     focus on 'targets' to be made
-;   batch files to 'do'
-;   separate
-;     compile
-;     link
-;     install
-;   infered
-;     compile & link
-;   action group
-;     ex. release
-;         debug
-;         test
-;         install > (do make stuff)
-;                   (do install stuff)
-;         clean > (undo make stuff)
-;                 (undo installed stuff)
-;   clean/uninstall
-
-; default target-set
-; default action
-
-; config what smake with no args does
-
-; use default target set
-; smake main.cpp main
-
-; do default action for tset install
-; smake -t install
+; check if files have changed and automatically rebuild
