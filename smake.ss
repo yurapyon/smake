@@ -1,7 +1,36 @@
 ; #!~/usr/bin/env gsi
 
 ; smake
-; [public domain]
+
+; can cache the .smake file too
+; check if files have changed and automatically rebuild
+
+(define (flatten lst)
+  (let rec ((lst lst)
+            (stack '())
+            (acc '()))
+    (cond
+      ((null? lst)
+       (if (null? stack)
+           (reverse! acc)
+           (rec (car stack)
+                (cdr stack)
+                acc)))
+      ((not (pair? lst))
+       (rec '()
+            stack
+            (cons lst acc)))
+      (else
+       (let ((obj (car lst)))
+         (if (pair? obj)
+             (if (null? (cdr lst))
+                 (rec obj stack acc)
+                 (rec obj
+                      (cons (cdr lst) stack)
+                      acc))
+             (rec (cdr lst)
+                  stack
+                  (cons obj acc))))))))
 
 (define (filter f lst)
   (fold-right
@@ -12,6 +41,16 @@
             acc)))
     '()
     lst))
+
+; todo handle last separator
+(define (join lst #!optional (separator " "))
+  (call-with-output-string
+    (lambda (p)
+      (map
+        (lambda (str)
+          (display str p)
+          (display separator p))
+        lst))))
 
 ;
 
@@ -47,7 +86,7 @@
 (define (matrix-map! f m)
   (let ((vec (matrix-_vec m)))
     (let rec ((n (- (vector-length vec) 1)))
-      (when (< n 0)
+      (unless (< n 0)
         (vector-set! vec n
           (f (vector-ref vec n)))
         (rec (- n 1))))))
@@ -56,9 +95,15 @@
   constructor: _make-graph
   read-only:
   matrix          ; x axis is start, y axis is end; for edge
-  ordering
+  iota            ; here for memory usage purposes
   lookup          ; target-name -> index
   reverse-lookup) ; index -> target
+
+(define (graph-node-count g)
+  (matrix-x-length (graph-matrix g)))
+
+; todo graph-node-count
+;      clean up
 
 (define (make-graph targets)
   (let* ((node-ct (length targets))
@@ -90,40 +135,73 @@
       targets
       _iota)
     (_make-graph matr
-                 (_gen-ordering matr)
+                 _iota
                  lookup
                  reverse-lookup)))
 
-(define (_gen-ordering matr)
-  (letrec* ((node-ct (matrix-x-length matr))
-            (_iota (iota node-ct))
+(define (graph-index->target g idx)
+  (let ((rl (graph-reverse-lookup g)))
+    (table-ref rl idx)))
+
+(define (graph-filename->index g fname)
+  (let ((l (graph-lookup g)))
+    (table-ref l fname)))
+
+(define (graph-ordering g)
+  (letrec* ((matr (graph-matrix g))
+            (node-ct (graph-node-count g))
             (mark-vec (make-vector node-ct #f))
             (push-vec (make-vector node-ct #f))
+            (ret '())
             (visit
               (lambda (idx)
                 (if (vector-ref mark-vec idx)
                     (when (not (vector-ref push-vec idx))
                       (error "cycle detected"))
-                    (let ((to-visit
-                            (filter
-                              (lambda (next)
-                                ; todo could check for cycles here for better error reporting
-                                (matrix-ref matr idx next))
-                              _iota)))
-                      (vector-set! mark-vec idx)
-                      (map visit to-visit)
-                      (vector-set! push-vec idx)
-                      (set! ret (cons idx ret))))))
-            (ret '()))
-    (map visit _iota)
+                    (begin
+                      (vector-set! mark-vec idx #t)
+                      (map visit (graph-get-children g idx))
+                      (vector-set! push-vec idx #t)
+                      (set! ret (cons idx ret)))))))
+    (map visit (graph-iota g))
     ret))
 
-(define (graph-object-ordering g)
-  (let ((rl (graph-reverse-lookup g)))
-    (map
-      (lambda (idx)
-        (table-ref rl idx))
-      (graph-ordering g))))
+(define (graph-get-children g idx)
+  (let* ((matr (graph-matrix g)))
+    (filter
+      (lambda (node)
+        (matrix-ref matr idx node))
+      (graph-iota g))))
+
+(define (graph-get-all-children g idx)
+  (letrec* ((push-vec (make-vector (graph-node-count g) #f))
+            (ret '())
+            (visit
+               (lambda (next)
+                 (map visit (graph-get-children g next))
+                 (when (not (vector-ref push-vec next))
+                   (vector-set! push-vec next #t)
+                   (set! ret (cons next ret))))))
+    (visit idx)
+    (cdr ret)))
+
+(define (>> g val)
+  (cond
+    ((string? val)
+     (graph-filename->index g val))
+    ((target? val)
+     (graph-filename->index g (target-filename val)))
+    (else
+     (error ">> error"))))
+
+(define (% g val)
+  (cond
+    ((number? val)
+     (graph-index->target g val))
+    ((list? val)
+     (map (lambda (v) (graph-index->target g v)) val))
+    (else
+     (error "g% error"))))
 
 ; file system stuff
 
@@ -163,10 +241,12 @@
   (unless (configured?)
     (verbose-create-file "script" (*script-filepath*)
       (lambda (p)
-        (display default-script p)))
+        (display default-script p)
+        (newline p)))
     (verbose-create-file "cache" (*cache-filepath*)
       (lambda (p)
-        (write default-cache p)))
+        (write default-cache p)
+        (newline p)))
     (display "smake configured")
     (newline)))
 
@@ -213,6 +293,8 @@
 
 ;
 
+(define hash=? string=?)
+
 (define (gen-hash filename)
   (let* ((ret (shell-command (string-append "md5sum " filename) #t))
          (err (car ret))
@@ -225,35 +307,73 @@
 (define (check-hash filename)
   (assert-initialized)
   (let* ((ht (*hashes*))
-         (cached (table-ref ht filename #f))))
-  (if (not cached)
-      #f
-      (string=? cached (gen-hash filename))))
+         (cached (table-ref ht filename #f)))
+    (and cached (hash=? cached (gen-hash filename)))))
 
 (define (update-hash! filename)
   (table-set! (*hashes*) filename (gen-hash filename)))
 
 ;
 
+; todo rename filename to output ?
+
 (define-type target
   read-only:
   filename
-  sources     ; filenames
-  rule        ; a fn to create target w/ filename
-  clean-rule) ; usually #f
+  sources    ; filenames
+  build-rule ; shell str to run when building
+  clean-rule ; usually #f
+  env-vars)  ; list of env vars to set when running rules
 
-; rules are funcitons that take a target and return a commandline to run
-; return "" to do nothing
+(define (with-target-environment tgt f)
+  (setenv "filename" (target-filename tgt))
+  (setenv "sources" (join (target-sources tgt)))
+  (map
+    (lambda (pair)
+      (setenv (car pair) (cdr pair)))
+    (target-env-vars tgt))
+  (f)
+  (map
+    (lambda (pair)
+      (setenv (car pair)))
+    (target-env-vars tgt))
+  (setenv "sources")
+  (setenv "filename"))
+
+
+; just returns err code from shell
+(define (build-target tgt)
+  (with-target-environment tgt
+    (lambda ()
+      (shell-command (target-build-rule tgt)))))
+
+(define (clean-target tgt)
+  (with-target-environment tgt
+    (lambda ()
+      (shell-command (target-clean-rule tgt)))))
+
+;
+
+(define (maybe-build targets)
+  (let* ((g (make-graph targets))
+         (changed-targets
+           (filter
+             (lambda (tgt)
+               (not (check-hash (target-filename tgt))))
+             targets)))
+    0))
 
 ;
 
 (define *c-compiler* (make-parameter "gcc"))
 (define *cpp-compiler* (make-parameter "g++"))
+(define *exe-linker* (make-parameter "g++"))
+(define *object-directory* (make-parameter "obj"))
 
 (define (objize filename)
   (let ((base (path-strip-extension filename)))
     (string-append
-      (path-expand base "obj")
+      (path-expand base (*object-directory*))
       ".o")))
 
 (define (compiler-for-file filename)
@@ -265,64 +385,35 @@
       (else
         (error "no compiler found:" filename)))))
 
-; todo cleanup all this
-; cmds can take a string or setenv variables
-(define (make-system-cmd cmd)
-  (lambda ()
-    (let ((ret (shell-command cmd #t)))
-      (when (not (= 0 (car ret)))
-        (println (cdr ret))
-        (error "command failed" cmd))
-      (println (cdr ret)))))
-
-(define (make-compile-str out in options)
-  (let ((p (open-output-string)))
-    (to-port p (compiler-for-file in) " ")
-    (for-each
-      (lambda (opt)
-        (to-port p opt " "))
-      options)
-    (to-port p "-c " in " -o " out)
-    (get-output-string p)))
-
-(define (make-null-rule file)
-  (lambda () #t))
-
-(define (make-default-clean-rule file)
-  (make-system-cmd (string-append "rm " file)))
-
-(define (make-target-basic-file filename sources)
+(define (make-basic-file filename sources)
   (make-target filename
                sources
-               (make-null-rule filename)
-               (make-null-rule filename)))
+               ""
+               ""
+              '()))
 
-(define (make-target-obj-file in options)
+(define (make-header-file filename)
+  (make-basic-file filename '()))
+
+(define (make-c-object-file in options)
   (let ((obj-name (objize in)))
     (make-target obj-name
                  (list in)
-                 (make-system-cmd (make-compile-str obj-name in options))
-                 (make-default-clean-rule obj-name))))
+                 "$compiler $options -c $sources -o $filename"
+                 "rm -f $filename"
+                 `(("compiler" . ,(compiler-for-file in))
+                   ("options" . ,options)))))
 
-(define targets
-  (list
-    (make-target "asdf.c" '() #f #f)
-    (make-target "a.c" '("asdf.c" "b.c") #f #f)
-    (make-target "b.c" '() #f #f)
-    (make-target "d.c" '("a.c") #f #f)))
+(define (make-executable out sources options)
+    (make-target out
+                 sources
+                 "$linker $options $sources -o $filename"
+                 "rm -f $filename"
+                 `(("linker" . ,(*exe-linker*))
+                   ("options" . ,options))))
 
-; (define (install-directory tgt)
-  ; (rm deps)
-  ; (cp (car deps) filename))
-
-; smake [command] [options]
-
-; (define (build ctx)
-  ; (if (ctx-has-option? 'debug)
-      ; (map
-        ; (lambda (tgt)
-          ; (add-target! ctx tgt)
-        ; debug-targets)
-
-; can cache the .smake file too
-; check if files have changed and automatically rebuild
+(define (make-installed-file dest src)
+  (make-target dest
+               src
+               "rm -f $filename; cp $sources $filename"
+               "rm -f $filename"))
