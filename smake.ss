@@ -1,6 +1,8 @@
-; smake
-
-; can cache the .smake file too
+; todo
+;   can cache the .smake.ss file too
+;   think about how to stop rebuild
+;     ie adding a comment to a file
+;   clean should reset cache?
 
 (define (flatten lst)
   (let rec ((lst lst)
@@ -49,6 +51,9 @@
           (display separator p))
         lst))))
 
+(define (always val)
+  (lambda args val))
+
 (define (to-port p . args)
   (for-each
     (lambda (a)
@@ -75,18 +80,7 @@
           (f n)
           (rec (+ n step))))))
 
-(define (range-map f range)
-  (let ((ret '())
-        (end (range-end range))
-        (step (range-step range)))
-     (let rec ((n (range-start range)))
-        (if (>= n end)
-            (reverse! ret)
-            (begin
-              (set! ret (cons (f n) ret))
-              (rec (+ n step)))))))
-
-(define (range-filter pred range)
+(define (range-_pmap pred f range)
   (let ((ret '())
         (end (range-end range))
         (step (range-step range)))
@@ -95,8 +89,14 @@
             (reverse! ret)
             (begin
               (when (pred n)
-                (set! ret (cons n ret)))
+                (set! ret (cons (f n) ret)))
               (rec (+ n step)))))))
+
+(define (range-map f range)
+  (range-_pmap (always #t) f range))
+
+(define (range-filter pred range)
+  (range-_pmap pred identity range))
 
 ;
 
@@ -112,14 +112,14 @@
                 x-len
                 y-len))
 
-(define (matrix-index m x y)
+(define (matrix-_vec-index m x y)
   (+ (* (matrix-x-length m) x) y))
 
 (define (matrix-ref m x y)
-  (vector-ref (matrix-_vec m) (matrix-index m x y)))
+  (vector-ref (matrix-_vec m) (matrix-_vec-index m x y)))
 
 (define (matrix-set! m x y to)
-  (vector-set! (matrix-_vec m) (matrix-index m x y) to))
+  (vector-set! (matrix-_vec m) (matrix-_vec-index m x y) to))
 
 ;
 
@@ -132,29 +132,29 @@
   range)
 
 (define (make-graph obj-lst id-fn sources-fn)
-  (let* ((node-ct (length targets))
-         (range (make-range 0 node-ct))
+  (let* ((node-ct (length obj-lst))
          (matr (make-matrix node-ct node-ct #f))
          (lookup (make-table))
-         (objects (list->vector obj-lst)))
-    (range-for
+         (objects (list->vector obj-lst))
+         (range (make-range 0 node-ct)))
+    (range-for-each
       (lambda (i)
         (let ((obj (vector-ref objects i)))
           (table-set! lookup (id-fn obj) i)))
       range)
-    (range-for
+    (range-for-each
       (lambda (i)
         (let* ((obj (vector-ref objects i))
-               (in-indicies
+               (src-indicies
                  (map
                    (lambda (src)
                      (or (table-ref lookup src #f)
                          (error "source not found" src)))
                    (sources-fn obj))))
           (map
-            (lambda (idx)
-              (matrix-set! matr idx i #t))
-            in-indicies)))
+            (lambda (src-idx)
+              (matrix-set! matr src-idx i #t))
+            src-indicies)))
       range)
     (let ((g (_make-graph matr
                           lookup
@@ -202,6 +202,7 @@
               (lambda (idx)
                 (if (vector-ref mark-vec idx)
                     (when (not (vector-ref push-vec idx))
+                      ; todo better error reporting use obj-ids
                       (error "cycle detected"))
                     (begin
                       (vector-set! mark-vec idx #t)
@@ -220,19 +221,21 @@
                  (for-each
                    mark!
                    (graph-get-all-children g idx))))))
-    (range-for
+    (range-for-each
       (lambda (i)
         (let ((obj (graph-index->object g i)))
           (when (p obj)
             (mark! i))))
       (graph-range g))
-    (range-filter
+    (filter
       (lambda (i)
         (vector-ref p-vec i))
-      (graph-range g))))
+      (graph-ordering g))))
 
 ; file system stuff
 
+; todo make these configureable?
+;      if not, just use constants not parameters
 (define *script-filepath* (make-parameter ".smake.ss"))
 (define *cache-filepath* (make-parameter "._smake.ss"))
 
@@ -287,10 +290,11 @@
 
 (define *initialized* (make-parameter #f))
 
-(define (initialized)
+(define (initialize)
   (assert-configured)
-  (load-cache))
-  ; load and run script
+  (load-cache)
+  (load (*script-filepath*))
+  (*initialized* #t))
 
 (define (assert-initialized)
   (unless (*initialized*)
@@ -334,9 +338,11 @@
 ; returns if hash matches cached hash
 (define (check-hash filename)
   (assert-initialized)
-  (let* ((ht (*hashes*))
-         (cached (table-ref ht filename #f)))
-    (and cached (hash=? cached (gen-hash filename)))))
+  (if (not (file-exists? filename))
+      #f
+      (let* ((ht (*hashes*))
+             (cached (table-ref ht filename #f)))
+        (and cached (hash=? cached (gen-hash filename))))))
 
 (define (update-hash! filename)
   (table-set! (*hashes*) filename (gen-hash filename)))
@@ -386,11 +392,25 @@
 
 (define (target-graph-get-changed g)
   (map
-    graph-index->object
+    (lambda (idx)
+      (graph-index->object g idx))
     (graph-propagate
       (lambda (tgt)
         (not (check-hash (target-filename tgt))))
       g)))
+
+(define (target-graph-rebuild-changed g)
+  (let ((changed (target-graph-get-changed g)))
+    (for-each
+      (lambda (tgt)
+        ; todo handle if failed
+        (display "building ")
+        (display (target-filename tgt))
+        (newline)
+        (build-target tgt)
+        (update-hash! (target-filename tgt)))
+      changed)
+    (save-cache)))
 
 ;
 

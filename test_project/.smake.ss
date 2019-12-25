@@ -1,5 +1,6 @@
 ; smake default script
 
+
 (define headers
   (list "wawa.h"))
 
@@ -21,11 +22,17 @@
         sources)
       (make-executable "main" (map objize sources) "-W -Wall"))))
 
-(define test
-  (make-target "test"
-               '("1" "2" "3")
-               "echo $filename $sources $opt"
-               "echo clean $filename"
-               '(("opt" . "-W -Wall"))))
+(define (build)
+  (let ((tg (make-target-graph targets)))
+    (target-graph-rebuild-changed tg)))
 
-(define g (make-graph targets))
+(define (clean)
+  (for-each
+    clean-target
+    targets))
+
+(define (install)
+  (build-target
+    (make-installed-file "install-dir/main" '("main"))))
+
+; (set-default-command! build)
