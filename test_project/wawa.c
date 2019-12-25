@@ -1,3 +1,3 @@
 int some_fn() {
-    return 5;
+    return 6;
 }

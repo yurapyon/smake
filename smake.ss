@@ -237,7 +237,7 @@
 ; todo make these configureable?
 ;      if not, just use constants not parameters
 (define *script-filepath* (make-parameter ".smake.ss"))
-(define *cache-filepath* (make-parameter "._smake.ss"))
+(define *cache-filepath* (make-parameter ".smake_cache.ss"))
 
 (define default-script "; smake default script")
 (define default-cache '((hashes . ())))
@@ -467,3 +467,42 @@
                "rm -f $filename; cp $sources $filename"
                "rm -f $filename"
                '()))
+
+(define *cmd-args* (make-parameter #f))
+
+(define *default-command* (make-parameter #f))
+
+(define _commands (make-table))
+
+(define (add-command! name fn)
+  (table-set! _commands name fn))
+
+(define (command-ref name)
+  (table-ref _commands name #f))
+
+; todo fix logic for configure and deconfigure
+(define (main)
+  (let ((args (command-line)))
+    (if (null? (cdr args))
+        (begin
+          (initialize)
+          (if (*default-command*)
+              ((*default-command*))
+              (error "unimplemented // default command not set")))
+        (let* ((shell-cmd (cdr args))
+               (smake-cmd (car shell-cmd))
+               (smake-args (cdr shell-cmd)))
+          (cond
+            ((string=? smake-cmd "configure")
+             (configure))
+            ((string=? smake-cmd "deconfigure")
+             (deconfigure))
+            (else
+              (initialize)
+              (*cmd-args* smake-args)
+              (let ((fn (command-ref smake-cmd)))
+                (if fn
+                    (fn)
+                    (error "command not found" smake-cmd)))))))))
+
+(main)
