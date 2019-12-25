@@ -1,9 +1,6 @@
-; #!~/usr/bin/env gsi
-
 ; smake
 
 ; can cache the .smake file too
-; check if files have changed and automatically rebuild
 
 (define (flatten lst)
   (let rec ((lst lst)
@@ -52,13 +49,54 @@
           (display separator p))
         lst))))
 
-;
-
 (define (to-port p . args)
   (for-each
     (lambda (a)
       (display a p))
     args))
+
+;
+
+(define-type range
+  constructor: _make-range
+  read-only:
+  start
+  end
+  step)
+
+(define (make-range start end #!optional (step 1))
+  (_make-range start end step))
+
+(define (range-for-each f range)
+  (let ((end (range-end range))
+        (step (range-step range)))
+     (let rec ((n (range-start range)))
+        (when (< n end)
+          (f n)
+          (rec (+ n step))))))
+
+(define (range-map f range)
+  (let ((ret '())
+        (end (range-end range))
+        (step (range-step range)))
+     (let rec ((n (range-start range)))
+        (if (>= n end)
+            (reverse! ret)
+            (begin
+              (set! ret (cons (f n) ret))
+              (rec (+ n step)))))))
+
+(define (range-filter pred range)
+  (let ((ret '())
+        (end (range-end range))
+        (step (range-step range)))
+     (let rec ((n (range-start range)))
+        (if (>= n end)
+            (reverse! ret)
+            (begin
+              (when (pred n)
+                (set! ret (cons n ret)))
+              (rec (+ n step)))))))
 
 ;
 
@@ -69,8 +107,8 @@
   x-length
   y-length)
 
-(define (make-matrix x-len y-len)
-  (_make-matrix (make-vector (* x-len y-len))
+(define (make-matrix x-len y-len . init-args)
+  (_make-matrix (apply make-vector (* x-len y-len) init-args)
                 x-len
                 y-len))
 
@@ -83,69 +121,76 @@
 (define (matrix-set! m x y to)
   (vector-set! (matrix-_vec m) (matrix-index m x y) to))
 
-(define (matrix-map! f m)
-  (let ((vec (matrix-_vec m)))
-    (let rec ((n (- (vector-length vec) 1)))
-      (unless (< n 0)
-        (vector-set! vec n
-          (f (vector-ref vec n)))
-        (rec (- n 1))))))
+;
 
 (define-type graph
   constructor: _make-graph
   read-only:
-  matrix          ; x axis is start, y axis is end; for edge
-  iota            ; here for memory usage purposes
-  lookup          ; target-name -> index
-  reverse-lookup) ; index -> target
+  matrix     ; x axis is start, y axis is end; for edge
+  lookup     ; obj-id -> index
+  objects    ; vector
+  range)
 
-(define (graph-node-count g)
-  (matrix-x-length (graph-matrix g)))
-
-; todo graph-node-count
-;      clean up
-
-(define (make-graph targets)
+(define (make-graph obj-lst id-fn sources-fn)
   (let* ((node-ct (length targets))
-         (_iota (iota node-ct))
-         (matr (make-matrix node-ct node-ct))
+         (range (make-range 0 node-ct))
+         (matr (make-matrix node-ct node-ct #f))
          (lookup (make-table))
-         (reverse-lookup (make-table)))
-    (matrix-map!
-      (lambda (_val) #f)
-      matr)
-    (map
-      (lambda (tgt i)
-        (table-set! lookup (target-filename tgt) i)
-        (table-set! reverse-lookup i tgt))
-      targets
-      _iota)
-    (map
-      (lambda (tgt i)
-        (let ((in-indicies
-                (map
-                  (lambda (src)
-                    (or (table-ref lookup src #f)
-                        (error "source not found" src)))
-                  (target-sources tgt))))
+         (objects (list->vector obj-lst)))
+    (range-for
+      (lambda (i)
+        (let ((obj (vector-ref objects i)))
+          (table-set! lookup (id-fn obj) i)))
+      range)
+    (range-for
+      (lambda (i)
+        (let* ((obj (vector-ref objects i))
+               (in-indicies
+                 (map
+                   (lambda (src)
+                     (or (table-ref lookup src #f)
+                         (error "source not found" src)))
+                   (sources-fn obj))))
           (map
             (lambda (idx)
               (matrix-set! matr idx i #t))
             in-indicies)))
-      targets
-      _iota)
-    (_make-graph matr
-                 _iota
-                 lookup
-                 reverse-lookup)))
+      range)
+    (let ((g (_make-graph matr
+                          lookup
+                          objects
+                          range)))
+      ; order the graph to detect cycles
+      (graph-ordering g)
+      g)))
 
-(define (graph-index->target g idx)
-  (let ((rl (graph-reverse-lookup g)))
-    (table-ref rl idx)))
+(define (graph-node-count g)
+  (matrix-x-length (graph-matrix g)))
 
-(define (graph-filename->index g fname)
-  (let ((l (graph-lookup g)))
-    (table-ref l fname)))
+(define (graph-index->object g idx)
+  (vector-ref (graph-objects g) idx))
+
+(define (graph-object-id->index g id)
+  (table-ref (graph-lookup g) id))
+
+(define (graph-get-children g idx)
+  (let ((matr (graph-matrix g)))
+    (range-filter
+      (lambda (i)
+        (matrix-ref matr idx i))
+      (graph-range g))))
+
+(define (graph-get-all-children g idx)
+  (letrec* ((push-vec (make-vector (graph-node-count g) #f))
+            (ret '())
+            (visit
+               (lambda (next)
+                 (map visit (graph-get-children g next))
+                 (when (not (vector-ref push-vec next))
+                   (vector-set! push-vec next #t)
+                   (set! ret (cons next ret))))))
+    (visit idx)
+    (cdr ret)))
 
 (define (graph-ordering g)
   (letrec* ((matr (graph-matrix g))
@@ -163,45 +208,28 @@
                       (map visit (graph-get-children g idx))
                       (vector-set! push-vec idx #t)
                       (set! ret (cons idx ret)))))))
-    (map visit (graph-iota g))
+    (range-map visit (graph-range g))
     ret))
 
-(define (graph-get-children g idx)
-  (let* ((matr (graph-matrix g)))
-    (filter
-      (lambda (node)
-        (matrix-ref matr idx node))
-      (graph-iota g))))
-
-(define (graph-get-all-children g idx)
-  (letrec* ((push-vec (make-vector (graph-node-count g) #f))
-            (ret '())
-            (visit
-               (lambda (next)
-                 (map visit (graph-get-children g next))
-                 (when (not (vector-ref push-vec next))
-                   (vector-set! push-vec next #t)
-                   (set! ret (cons next ret))))))
-    (visit idx)
-    (cdr ret)))
-
-(define (>> g val)
-  (cond
-    ((string? val)
-     (graph-filename->index g val))
-    ((target? val)
-     (graph-filename->index g (target-filename val)))
-    (else
-     (error ">> error"))))
-
-(define (% g val)
-  (cond
-    ((number? val)
-     (graph-index->target g val))
-    ((list? val)
-     (map (lambda (v) (graph-index->target g v)) val))
-    (else
-     (error "g% error"))))
+(define (graph-propagate p g)
+  (letrec ((p-vec (make-vector (graph-node-count g) #f))
+           (mark!
+             (lambda (idx)
+               (unless (vector-ref p-vec idx)
+                 (vector-set! p-vec idx #t)
+                 (for-each
+                   mark!
+                   (graph-get-all-children g idx))))))
+    (range-for
+      (lambda (i)
+        (let ((obj (graph-index->object g i)))
+          (when (p obj)
+            (mark! i))))
+      (graph-range g))
+    (range-filter
+      (lambda (i)
+        (vector-ref p-vec i))
+      (graph-range g))))
 
 ; file system stuff
 
@@ -217,7 +245,7 @@
 
 (define (assert-configured)
   (unless (configured?)
-    (error "smake not configure. please call (configure)")))
+    (error "smake not configured. please call (configure)")))
 
 (define (verbose-create-file type name init-fn)
   (unless (file-exists? name)
@@ -340,7 +368,6 @@
   (setenv "sources")
   (setenv "filename"))
 
-
 ; just returns err code from shell
 (define (build-target tgt)
   (with-target-environment tgt
@@ -354,14 +381,16 @@
 
 ;
 
-(define (maybe-build targets)
-  (let* ((g (make-graph targets))
-         (changed-targets
-           (filter
-             (lambda (tgt)
-               (not (check-hash (target-filename tgt))))
-             targets)))
-    0))
+(define (make-target-graph targets)
+  (make-graph targets target-filename target-sources))
+
+(define (target-graph-get-changed g)
+  (map
+    graph-index->object
+    (graph-propagate
+      (lambda (tgt)
+        (not (check-hash (target-filename tgt))))
+      g)))
 
 ;
 
@@ -416,4 +445,5 @@
   (make-target dest
                src
                "rm -f $filename; cp $sources $filename"
-               "rm -f $filename"))
+               "rm -f $filename"
+               '()))
