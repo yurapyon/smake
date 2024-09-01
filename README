@@ -1,0 +1,15 @@
+smake
+
+c/c++ build system
+
+features:
+  build scripts written in scheme 
+  dependency graph
+    file hashing/caching to determine when things have changed
+
+you need:
+  guile
+
+example build script in test_project/.smake.ss
+
+public domain
